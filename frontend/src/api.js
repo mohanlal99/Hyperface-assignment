@@ -3,7 +3,7 @@
 
 
 
-const BASE_URL = 'http://localhost:5000';
+const BASE_URL = 'https://hyperface-assignment-wayx.vercel.app';
 
 // Submit a new ticket
 export async function createTicket(ticketData) {
