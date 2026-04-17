@@ -1,193 +1,276 @@
-import express from "express";
-import { v4 as uuidv4 } from "uuid";
-import genAi from "../config/google.api.js";
+// routes/tickets.js
+
+
+import express from 'express';
+import Ticket from '../models/Ticket.js';
+import Message from '../models/Message.js';
+import { requireAuth, requireAdmin } from '../middleware/auth.js';
+
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { configDotenv } from 'dotenv';
+
+configDotenv()
 
 const router = express.Router();
 
 
-// In-memory "database" — just a plain array.
-// Tickets are stored here while the server runs.
+// HELPER: Send ticket to Gemini for classification
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-let tickets = [];
+async function classifyWithAI(description) {
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash", 
+  });
 
-// HELPER: Call Gemini AI to classify the ticket
-async function callGeminiAI(issueDescription) {
+  const prompt = `
+You are a support ticket classifier for HyperFace.
+
+Return ONLY valid JSON (no markdown, no extra text):
+
+{
+  "category": "PAYMENT or LOGIN or BUG or OTHER",
+  "reply": "Short professional reply (max 2 sentences)",
+  "confidence": number between 0 and 100
+}
+
+Ticket: "${description}"
+`;
+
   try {
-    // Use latest working model
-    const model = genAi.getGenerativeModel({
-      model: "gemini-2.5-flash-lite",
-    });
-
-    const prompt = `You are a customer support assistant.
-
-            Classify the ticket into ONE category:
-            PAYMENT, LOGIN, BUG, OTHER
-
-          Also generate a short professional reply.
-
-          Return ONLY JSON:
-          {
-            "category": "",
-            "reply": "",
-            "confidence": 0-100
-          }
-
-          Ticket: ${issueDescription}
-        `;
-
     const result = await model.generateContent(prompt);
-    const response = await result.response;
 
-    // IMPORTANT: text() is a function
-    const text = response.text();
+    let text = result.response.text();
 
-    // Clean response (remove ``` if exists)
-    const cleanText = text.replace(/```json|```/g, "").trim();
+    // Clean markdown if exists
+    text = text.replace(/```json|```/g, "").trim();
 
-    let parsed;
-
-    try {
-      parsed = JSON.parse(cleanText);
-    } catch (err) {
-      // If JSON fails → fallback
-      parsed = {
-        category: "OTHER",
-        reply: "We will get back to you shortly.",
-        confidence: 0,
-      };
-    }
-
-    // Ensure valid category
-    const validCategories = ["PAYMENT", "LOGIN", "BUG", "OTHER"];
-
-    return {
-      category: validCategories.includes(parsed.category)
-        ? parsed.category
-        : "OTHER",
-      reply: parsed.reply || "We will get back to you shortly.",
-      confidence: parsed.confidence || 0,
-    };
-  } catch (error) {
-    console.error("Gemini SDK Error:", error.message);
+    return JSON.parse(text);
+  } catch (err) {
+    console.error("AI error:", err.message);
 
     return {
       category: "OTHER",
-      reply: "We will get back to you shortly.",
+      reply:
+        "Thank you for reaching out. Our support team will get back to you shortly.",
       confidence: 0,
     };
   }
 }
 
+// ----------------------------------------
+// POST /tickets — Create a new ticket
+// (user only)
+// ----------------------------------------
+router.post("/", requireAuth, async (req, res) => {
+  const { description, priority } = req.body;
 
-// POST /tickets
-// Creates a new ticket, then calls AI to classify it and generate a reply.
-router.post("/", async (req, res) => {
-  const { name, email, description, priority } = req.body;
-
-  // Make sure all required fields are present
-  if (!name || !email || !description) {
+  if (!description || description.trim().length < 10) {
     return res
       .status(400)
-      .json({ error: "Name, email, and description are required." });
+      .json({ error: "Please describe your issue in at least 10 characters." });
   }
 
-  // Build the ticket object with default values
-  const ticket = {
-    id: uuidv4(), // Unique ID
-    name,
-    email,
-    description,
-    priority: priority || "MEDIUM", // LOW / MEDIUM / HIGH
-    status: "OPEN", // All tickets start as OPEN
-    category: "OTHER", // Will be updated by AI
-    aiReply: "We will get back to you shortly.", // Default reply if AI fails
-    confidence: 0,
-    createdAt: new Date().toISOString(),
-    updatedAt: null,
-  };
-
-  // Save the ticket right away (before calling AI)
-  // This way, even if AI fails, the ticket is saved.
-  tickets.push(ticket);
-
-  // Now call Gemini AI to classify the ticket
   try {
-    const aiResult = await callGeminiAI(description);
+    // Create the ticket immediately with defaults
+    const ticket = await Ticket.create({
+      userId: req.user._id,
+      userName: req.user.name,
+      userEmail: req.user.email,
+      description: description.trim(),
+      priority: priority || "MEDIUM",
+      status: "OPEN",
+    });
 
-    // Update ticket with what AI returned
-    ticket.category = aiResult.category || "OTHER";
-    ticket.aiReply = aiResult.reply || "We will get back to you shortly.";
-    ticket.confidence = aiResult.confidence || 0;
+    // Default AI reply in case Gemini fails
+    let aiReply =
+      "Thank you for reaching out. Our support team will review your issue and get back to you shortly.";
+    let category = "OTHER";
+    let confidence = 0;
 
-    console.log(`✅ AI classified ticket as: ${ticket.category}`);
-  } catch (aiError) {
-    // AI call failed — that's okay, ticket is already saved with default values
-    console.error("⚠️  AI failed, using defaults. Error:", aiError.message);
+    // Call Gemini AI
+    try {
+      const aiResult = await classifyWithAI(description);
+      category = aiResult.category || "OTHER";
+      aiReply = aiResult.reply || aiReply;
+      confidence = aiResult.confidence || 0;
+
+      // Update ticket with AI results
+      ticket.category = category;
+      ticket.confidence = confidence;
+      ticket.aiProcessed = true;
+      await ticket.save();
+    } catch (aiErr) {
+      console.error("⚠️ AI classification failed:", aiErr.message);
+      // Ticket already saved — just continue with defaults
+    }
+
+    // Save AI's first reply as the first message in the chat
+    await Message.create({
+      ticketId: ticket._id,
+      sender: "ai",
+      senderName: "HyperFace AI",
+      content: aiReply,
+    });
+
+    res.status(201).json(ticket);
+  } catch (err) {
+    console.error("Create ticket error:", err);
+    res.status(500).json({ error: "Failed to create ticket." });
   }
-
-  // Return the saved ticket to the frontend
-  res.status(201).json(ticket);
 });
 
+// ----------------------------------------
+// GET /tickets — Get tickets
+// Admin: all tickets | User: their own tickets
+// Supports filters: status, category, priority, search, date
+// ----------------------------------------
+router.get("/", requireAuth, async (req, res) => {
+  try {
+    const { status, category, priority, search, dateRange } = req.query;
 
-// GET /tickets
-// Returns all tickets (newest first)
-router.get("/", (req, res) => {
-  // Reverse so newest tickets show first
-  const sortedTickets = [...tickets].reverse();
-  res.json(sortedTickets);
+    // Build the MongoDB filter
+    let filter = {};
+
+    // Users can only see their own tickets
+    if (req.user.role === "user") {
+      filter.userId = req.user._id;
+    }
+
+    if (status && status !== "ALL") filter.status = status;
+    if (category && category !== "ALL") filter.category = category;
+    if (priority && priority !== "ALL") filter.priority = priority;
+
+    // Date range filter
+    if (dateRange && dateRange !== "ALL") {
+      const now = new Date();
+      const ranges = {
+        TODAY: new Date(now.setHours(0, 0, 0, 0)),
+        WEEK: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+        MONTH: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+      };
+      if (ranges[dateRange]) {
+        filter.createdAt = { $gte: ranges[dateRange] };
+      }
+    }
+
+    // Text search (searches description, userName, userEmail)
+    if (search && search.trim()) {
+      const regex = new RegExp(search.trim(), "i");
+      filter.$or = [
+        { description: regex },
+        { userName: regex },
+        { userEmail: regex },
+      ];
+    }
+
+    const tickets = await Ticket.find(filter).sort({ createdAt: -1 });
+    res.json(tickets);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch tickets." });
+  }
 });
 
+// ----------------------------------------
+// GET /tickets/:id — Get a single ticket
+// ----------------------------------------
+router.get("/:id", requireAuth, async (req, res) => {
+  try {
+    const ticket = await Ticket.findById(req.params.id);
+    if (!ticket) return res.status(404).json({ error: "Ticket not found." });
 
-// GET /tickets/:id
-// Returns one specific ticket by its ID
-router.get("/:id", (req, res) => {
-  const ticket = tickets.find((t) => t.id === req.params.id);
+    // User can only see their own tickets
+    if (
+      req.user.role === "user" &&
+      ticket.userId.toString() !== req.user._id.toString()
+    ) {
+      return res.status(403).json({ error: "Access denied." });
+    }
 
-  if (!ticket) {
-    return res.status(404).json({ error: "Ticket not found." });
+    res.json(ticket);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch ticket." });
   }
-
-  res.json(ticket);
 });
 
+// ----------------------------------------
+// PATCH /tickets/:id/status — Update ticket status
+// (admin only)
+// ----------------------------------------
+router.patch("/:id/status", requireAuth, requireAdmin, async (req, res) => {
+  const { status } = req.body;
 
-// POST /tickets/:id/status
-// Toggles ticket status between OPEN and RESOLVED
-router.post("/:id/status", (req, res) => {
-  const ticket = tickets.find((t) => t.id === req.params.id);
-
-  if (!ticket) {
-    return res.status(404).json({ error: "Ticket not found." });
+  if (!["OPEN", "IN_PROGRESS", "RESOLVED"].includes(status)) {
+    return res
+      .status(400)
+      .json({ error: "Status must be OPEN, IN_PROGRESS, or RESOLVED." });
   }
 
-  // Flip the status
-  ticket.status = ticket.status === "OPEN" ? "RESOLVED" : "OPEN";
-  ticket.updatedAt = new Date().toISOString();
-
-  res.json(ticket);
+  try {
+    const ticket = await Ticket.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true }, // Return the updated document
+    );
+    if (!ticket) return res.status(404).json({ error: "Ticket not found." });
+    res.json(ticket);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update status." });
+  }
 });
 
+// ----------------------------------------
+// PATCH /tickets/:id/priority — Update priority
+// (admin only)
+// ----------------------------------------
+router.patch("/:id/priority", requireAuth, requireAdmin, async (req, res) => {
+  const { priority } = req.body;
 
-// POST /tickets/:id/reply
-// Updates the AI-generated reply manually (useful if AI gave a bad reply)
-router.post("/:id/reply", (req, res) => {
-  const { reply } = req.body;
-  const ticket = tickets.find((t) => t.id === req.params.id);
-
-  if (!ticket) {
-    return res.status(404).json({ error: "Ticket not found." });
+  if (!["LOW", "MEDIUM", "HIGH"].includes(priority)) {
+    return res
+      .status(400)
+      .json({ error: "Priority must be LOW, MEDIUM, or HIGH." });
   }
 
-  if (!reply || reply.trim() === "") {
-    return res.status(400).json({ error: "Reply text cannot be empty." });
+  try {
+    const ticket = await Ticket.findByIdAndUpdate(
+      req.params.id,
+      { priority },
+      { new: true },
+    );
+    if (!ticket) return res.status(404).json({ error: "Ticket not found." });
+    res.json(ticket);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update priority." });
   }
-
-  ticket.aiReply = reply;
-  ticket.updatedAt = new Date().toISOString();
-
-  res.json(ticket);
 });
 
+// ----------------------------------------
+// GET /tickets/stats/overview — Dashboard stats for admin
+// ----------------------------------------
+router.get("/stats/overview", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [total, open, inProgress, resolved, highPriority] = await Promise.all(
+      [
+        Ticket.countDocuments(),
+        Ticket.countDocuments({ status: "OPEN" }),
+        Ticket.countDocuments({ status: "IN_PROGRESS" }),
+        Ticket.countDocuments({ status: "RESOLVED" }),
+        Ticket.countDocuments({
+          priority: "HIGH",
+          status: { $ne: "RESOLVED" },
+        }),
+      ],
+    );
 
-export default router
+    // Category distribution
+    const categoryData = await Ticket.aggregate([
+      { $group: { _id: "$category", count: { $sum: 1 } } },
+    ]);
+
+    res.json({ total, open, inProgress, resolved, highPriority, categoryData });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch stats." });
+  }
+});
+
+export default router;
